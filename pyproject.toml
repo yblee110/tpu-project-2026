@@ -8,4 +8,8 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "torch>=2.9.1",
+    "jax>=0.4.35",
+    "flax>=0.10.2",
+    "optax>=0.2.3",
+    "kagglehub>=0.3.3",
 ]

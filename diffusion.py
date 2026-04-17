@@ -4,10 +4,13 @@
 import os
 import sys
 import time
+import glob
+import re
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import kagglehub
 
 # hyperparameters
 batch_size = 64  # how many independent sequences will we process in parallel?
@@ -29,8 +32,21 @@ head_dim = n_embd // n_head
 torch.manual_seed(1337)
 
 # Load data
-with open("data.txt", "r", encoding="utf-8") as f:
-    text = f.read()
+path = kagglehub.dataset_download("talesgomes27/sherleck-books")
+text = ""
+for file in glob.glob(os.path.join(path, "*.txt")):
+    with open(file, "r", encoding="utf-8") as f:
+        content = f.read()
+        # Remove Project Gutenberg header
+        match_start = re.search(r"\*\*\*\s*START OF THE PROJECT GUTENBERG EBOOK.*?\*\*\*", content, re.IGNORECASE)
+        if match_start:
+            content = content[match_start.end():]
+        # Remove Project Gutenberg footer
+        match_end = re.search(r"\*\*\*\s*END OF THE PROJECT GUTENBERG EBOOK", content, re.IGNORECASE)
+        if match_end:
+            content = content[:match_end.start()]
+        
+        text += content.strip() + "\n\n"
 
 # All the unique characters that occur in this text
 chars = sorted(list(set(text)))

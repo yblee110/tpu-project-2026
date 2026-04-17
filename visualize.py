@@ -1,95 +1,85 @@
 """
 Visualize the generation process step by step
-Shows diffusion denoising and/or GPT autoregressive generation
+Shows diffusion denoising in a cryptographic terminal theme.
 """
 
 import sys
 import os
+import time
+import random
 import argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 
 import diffusion
 import gpt
 
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
 
-def generate_diffusion_frames(
-    model,
-    num_blocks=5,
-    prompt_len=16,
-    temp=0.8,
-    confidence_threshold=0.95,
-    top_k=2,
-):
-    """
-    Generate samples and capture each denoising step
+def display_crypto_state_terminal(tokens, block_mask, block_start, is_gpt=False):
+    clear_screen()
+    
+    crypto_chars = ['@', '#', '$', '%', '&', '*', '?', '!', '~', '+', '=', 'A', 'X', 'Z', 'Q']
+    
+    # ANSI Colors
+    GRAY = "\033[90m"
+    BLUE = "\033[94;1m"
+    RED = "\033[91;1m"
+    RESET = "\033[0m"
+    
+    # 1. Completed text (past blocks)
+    completed_text = diffusion.decode(tokens[:block_start])
+    
+    # 2. Current block
+    current_text_parts = []
+    for i, token in enumerate(tokens[block_start:]):
+        if i < len(block_mask) and block_mask[i]:
+            current_text_parts.append(f"{BLUE}{random.choice(crypto_chars)}{RESET}")
+        else:
+            char = diffusion.decode([token])
+            current_text_parts.append(f"{RED}{char}{RESET}")
+            
+    current_text = "".join(current_text_parts)
+    
+    if is_gpt:
+        print(f"\033[97;1m🤖 GPT: Autoregressive Generation...\033[0m\n")
+    else:
+        print(f"\033[97;1m🕵️‍♂️ Sherlock Holmes: Cryptographic Decoupling...\033[0m\n")
+        
+    print(f"{GRAY}{completed_text}{RESET}{current_text}")
+    print("\n" + "-"*50)
+    time.sleep(0.05 if not is_gpt else 0.02)
 
-    Args:
-        model: The trained diffusion model
-        num_blocks: Number of blocks to generate
-        prompt_len: Length of initial prompt
-        temp: Sampling temperature
-        confidence_threshold: Confidence threshold for decoding
-        top_k: Top-k sampling parameter
-
-    Returns:
-        List of (all_tokens, mask_for_all, block_idx) tuples for each frame
-    """
+def generate_and_visualize_diffusion(model, num_blocks=5, prompt_len=16, temp=0.8, confidence_threshold=0.95, top_k=2):
     device = next(model.parameters()).device
     block_size = diffusion.block_size
     mask_token_id = diffusion.mask_token_id
 
-    print(f"Pre-calculating {num_blocks} blocks for diffusion...")
-
-    all_frames = []
-    all_tokens_history = diffusion.data[:prompt_len].tolist()
-
-    def capture_frame(all_tokens_history, x, masked, block_idx):
-        """Build and capture full sequence frame"""
-        full_tokens = torch.tensor(all_tokens_history, dtype=torch.long, device=device)
-        full_tokens = torch.cat(
-            [full_tokens, x[0, prompt_len : prompt_len + block_len]]
-        )
-        full_mask = torch.zeros(len(full_tokens), dtype=torch.bool, device=device)
-        full_mask[len(all_tokens_history) :] = masked[
-            0, prompt_len : prompt_len + block_len
-        ]
-        all_frames.append(
-            (full_tokens.cpu().clone(), full_mask.cpu().clone(), block_idx)
-        )
-
+    all_tokens = diffusion.data[:prompt_len].tolist()
+    
     for block_idx in range(num_blocks):
-        # How many tokens to generate this block
+        block_start = len(all_tokens)
         max_new_tokens = 240
         block_len = min(block_size - prompt_len, max_new_tokens)
 
-        # Initialize: last prompt_len tokens + masks
         x = torch.full((1, block_size), mask_token_id, dtype=torch.long, device=device)
-        x[0, :prompt_len] = torch.tensor(
-            all_tokens_history[-prompt_len:], device=device
-        )
+        x[0, :prompt_len] = torch.tensor(all_tokens[-prompt_len:], device=device)
 
-        # Track which positions need decoding
         masked = torch.zeros(1, block_size, dtype=torch.bool, device=device)
         masked[0, prompt_len : prompt_len + block_len] = True
 
-        capture_frame(all_tokens_history, x, masked, block_idx)
+        temp_tokens = list(all_tokens) + [mask_token_id] * block_len
 
-        # Iteratively decode
-        step = 0
         while masked.any():
-            # Get predictions and confidences
             logits, _ = model(x)
             probs = F.softmax(logits / temp, dim=-1)
             top_k_probs, top_k_indices = torch.topk(probs, k=top_k, dim=-1)
             confidences = top_k_probs.sum(dim=-1)
 
-            # Decode high-confidence masked positions (or at least 1)
             decode_mask = (confidences >= confidence_threshold) & masked
             if not decode_mask.any():
                 masked_confidences = torch.where(
@@ -97,36 +87,33 @@ def generate_diffusion_frames(
                 )
                 decode_mask.view(-1)[masked_confidences.argmax()] = True
 
-            # Sample from top-k and update
             top_k_probs_norm = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-            sampled_k = torch.multinomial(top_k_probs_norm.view(-1, top_k), 1).view(
-                1, block_size
-            )
-            sampled_tokens = torch.gather(
-                top_k_indices, -1, sampled_k.unsqueeze(-1)
-            ).squeeze(-1)
+            sampled_k = torch.multinomial(top_k_probs_norm.view(-1, top_k), 1).view(1, block_size)
+            sampled_tokens = torch.gather(top_k_indices, -1, sampled_k.unsqueeze(-1)).squeeze(-1)
 
             x = torch.where(decode_mask, sampled_tokens, x)
             masked = masked & ~decode_mask
 
-            capture_frame(all_tokens_history, x, masked, block_idx)
-            step += 1
+            current_block_tokens = x[0, prompt_len : prompt_len + block_len].cpu().numpy()
+            current_mask = masked[0, prompt_len : prompt_len + block_len].cpu().numpy()
+            
+            temp_tokens[block_start:] = current_block_tokens.tolist()
+            display_crypto_state_terminal(temp_tokens, current_mask, block_start)
 
-        # Extract and append generated tokens for next block
-        all_tokens_history.extend(x[0, prompt_len : prompt_len + block_len].tolist())
+        all_tokens.extend(x[0, prompt_len : prompt_len + block_len].tolist())
 
-    print(f"Diffusion: Generated {len(all_frames)} frames")
-    return all_frames
+    clear_screen()
+    print("\n✨ Diffusion decoding complete! (Final Output):\n")
+    print(diffusion.decode(all_tokens))
+    print("\n" + "="*50 + "\n")
+    time.sleep(2)
 
-
-def generate_gpt_output(model, max_new_tokens, prompt_len=16, temp=0.8):
-    """Generate full GPT output once"""
+def generate_and_visualize_gpt(model, max_new_tokens, prompt_len=16, temp=0.8):
     device = next(model.parameters()).device
     block_size = gpt.block_size
 
-    print(f"Generating {max_new_tokens} tokens with GPT...")
-
-    x = gpt.data[:prompt_len].unsqueeze(0).to(device)
+    all_tokens = gpt.data[:prompt_len].tolist()
+    x = torch.tensor(all_tokens, dtype=torch.long, device=device).unsqueeze(0)
 
     for _ in range(max_new_tokens):
         cur_context = x[:, -block_size:]
@@ -135,173 +122,24 @@ def generate_gpt_output(model, max_new_tokens, prompt_len=16, temp=0.8):
         probs = F.softmax(logits / temp, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         x = torch.cat((x, next_token), dim=1)
+        
+        all_tokens.append(next_token.item())
+        
+        # Display
+        display_crypto_state_terminal(all_tokens, [False], len(all_tokens)-1, is_gpt=True)
 
-    return x[0].cpu()
-
-
-def animate_diffusion(diffusion_frames, num_blocks, chars_per_row=64):
-    """Create animation for diffusion model only"""
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-
-    text_obj = ax.text(
-        0.5,
-        0.5,
-        "",
-        ha="center",
-        va="center",
-        fontsize=8,
-        family="monospace",
-        linespacing=1.2,
-        multialignment="left",
-    )
-
-    title = fig.suptitle("", fontsize=12)
-
-    def update(frame_idx):
-        # Use the last frame if we're in the pause period
-        actual_idx = min(frame_idx, len(diffusion_frames) - 1)
-        frame_tokens, mask, block_idx = diffusion_frames[actual_idx]
-
-        text_chars = []
-        for idx in range(len(frame_tokens)):
-            char = diffusion.decode([frame_tokens[idx].item()])
-            if char == "\n":
-                char = " "
-            text_chars.append("█" if mask[idx] else char)
-
-        continuous_text = "".join(text_chars)
-        lines = [
-            continuous_text[i : i + chars_per_row]
-            for i in range(0, len(continuous_text), chars_per_row)
-        ]
-        text_obj.set_text("\n".join(lines))
-
-        num_masked = mask.sum().item()
-        title.set_text(
-            f"Diffusion - Block {block_idx + 1}/{num_blocks} - Remaining: {num_masked} tokens"
-        )
-
-        return [text_obj, title]
-
-    # Add pause frames at the end (50 frames = 500ms pause)
-    pause_frames = 50
-    total_frames = len(diffusion_frames) + pause_frames
-
-    anim = FuncAnimation(
-        fig, update, frames=total_frames, interval=10, blit=False, repeat=True
-    )
-    plt.tight_layout()
-    return anim
-
-
-def animate_comparison(
-    diffusion_frames, gpt_tokens, num_blocks, prompt_len, chars_per_row=64
-):
-    """Create animation comparing diffusion and GPT"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-
-    for ax in [ax1, ax2]:
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis("off")
-
-    text_obj1 = ax1.text(
-        0.5,
-        0.5,
-        "",
-        ha="center",
-        va="center",
-        fontsize=8,
-        family="monospace",
-        linespacing=1.2,
-        multialignment="left",
-    )
-
-    text_obj2 = ax2.text(
-        0.5,
-        0.5,
-        "",
-        ha="center",
-        va="center",
-        fontsize=8,
-        family="monospace",
-        linespacing=1.2,
-        multialignment="left",
-    )
-
-    def update(frame_idx):
-        # Update diffusion (top)
-        # Use the last frame if we're in the pause period
-        diffusion_idx = min(frame_idx, len(diffusion_frames) - 1)
-        frame_tokens, mask, block_idx = diffusion_frames[diffusion_idx]
-
-        text_chars = []
-        for idx in range(len(frame_tokens)):
-            char = diffusion.decode([frame_tokens[idx].item()])
-            if char == "\n":
-                char = " "
-            text_chars.append("█" if mask[idx] else char)
-
-        continuous_text = "".join(text_chars)
-        lines = [
-            continuous_text[i : i + chars_per_row]
-            for i in range(0, len(continuous_text), chars_per_row)
-        ]
-        text_obj1.set_text("\n".join(lines))
-
-        num_masked = mask.sum().item()
-        ax1.set_title(
-            f"Diffusion - Block {block_idx + 1}/{num_blocks} - Remaining: {num_masked} tokens",
-            fontsize=12,
-            pad=-20,
-            y=0.98,
-        )
-
-        # Update GPT (bottom) - show tokens one by one
-        gpt_idx = min(frame_idx + prompt_len, len(gpt_tokens))
-        visible_tokens = gpt_tokens[:gpt_idx]
-
-        text_chars = [
-            gpt.decode([t.item()]) if gpt.decode([t.item()]) != "\n" else " "
-            for t in visible_tokens
-        ]
-        continuous_text = "".join(text_chars)
-        lines = [
-            continuous_text[i : i + chars_per_row]
-            for i in range(0, len(continuous_text), chars_per_row)
-        ]
-        text_obj2.set_text("\n".join(lines))
-
-        ax2.set_title(
-            f"GPT - Token {gpt_idx}/{len(gpt_tokens)} (Autoregressive)",
-            fontsize=12,
-            pad=-20,
-            y=0.98,
-        )
-
-        return [text_obj1, text_obj2]
-
-    # Add pause frames at the end (50 frames = 500ms pause)
-    pause_frames = 50
-    max_frames = max(len(diffusion_frames), len(gpt_tokens) - prompt_len) + pause_frames
-
-    anim = FuncAnimation(
-        fig, update, frames=max_frames, interval=10, blit=False, repeat=True
-    )
-
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
-    return anim
+    clear_screen()
+    print("\n✨ GPT generation complete! (Final Output):\n")
+    print(gpt.decode(all_tokens))
+    print("\n" + "="*50 + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize diffusion and/or GPT generation"
+        description="Visualize diffusion and/or GPT generation in terminal"
     )
     parser.add_argument(
-        "--compare", action="store_true", help="Show both diffusion and GPT animations"
+        "--compare", action="store_true", help="Show diffusion then GPT sequentially"
     )
     parser.add_argument(
         "--blocks",
@@ -329,38 +167,33 @@ def main():
 
     # Load and generate diffusion
     diffusion_path = os.path.join(os.path.dirname(__file__), "weights", "diffusion.pt")
+    if not os.path.exists(diffusion_path):
+        print(f"Error: Weights not found at {diffusion_path}. Run 'uv run diffusion.py --train' first or download weights.")
+        return
+
     print(f"Loading diffusion model from {diffusion_path}...")
     diffusion_model = diffusion.Model().to(device)
-    diffusion_model.load_state_dict(torch.load(diffusion_path, map_location=device))
+    diffusion_model.load_state_dict(torch.load(diffusion_path, map_location=device, weights_only=True))
     diffusion_model.eval()
 
-    diffusion_frames = generate_diffusion_frames(
+    generate_and_visualize_diffusion(
         diffusion_model, args.blocks, args.prompt_len
     )
 
     if args.compare:
-        # Calculate how many tokens diffusion generates
         max_new_tokens = args.blocks * (diffusion.block_size - args.prompt_len)
 
-        # Load and generate GPT
         gpt_path = os.path.join(os.path.dirname(__file__), "weights", "gpt.pt")
+        if not os.path.exists(gpt_path):
+            print(f"Error: Weights not found at {gpt_path}.")
+            return
+            
         print(f"Loading GPT model from {gpt_path}...")
         gpt_model = gpt.Model().to(device)
-        gpt_model.load_state_dict(torch.load(gpt_path, map_location=device))
+        gpt_model.load_state_dict(torch.load(gpt_path, map_location=device, weights_only=True))
         gpt_model.eval()
 
-        gpt_tokens = generate_gpt_output(gpt_model, max_new_tokens, args.prompt_len)
-
-        print("Done! Showing comparison animation...\n")
-        anim = animate_comparison(
-            diffusion_frames, gpt_tokens, args.blocks, args.prompt_len
-        )
-    else:
-        print("Done! Showing diffusion animation...\n")
-        anim = animate_diffusion(diffusion_frames, args.blocks)
-
-    plt.show()
-
+        generate_and_visualize_gpt(gpt_model, max_new_tokens, args.prompt_len)
 
 if __name__ == "__main__":
     main()
