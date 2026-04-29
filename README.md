@@ -114,6 +114,8 @@ The diffusion model makes **5 key changes** to the GPT architecture:
 
 
 ## Acknowledgements
+This project is a fork and extension of the original [tiny-diffusion](https://github.com/nathan-barry/tiny-diffusion) repository created by Nathan Barry. The JAX/Flax implementations and TPU adaptations were built upon this fantastic foundational work.
+
 The code for `gpt.py` and `diffusion.py` take heavy inspiration from the Andrej Karpathy GPT implementations listed below:
 - [nanochat GPT implementation](https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py)
 - ["Let's build GPT" video GPT implementation](https://github.com/karpathy/ng-video-lecture/blob/master/gpt.py)
