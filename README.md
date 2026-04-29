@@ -1,130 +1,232 @@
-# tiny-diffusion
+# GPT Writes One Token at a Time. This Model Writes Entire Blocks at Once.
 
-A character-level language diffusion model for text generation trained on Sherlock Holmes books, in ~365 lines of code! It is only 10.7 million parameters (for the base PyTorch version), so you can also try it out locally!
+## Building a Diffusion Language Model from Scratch with Flax NNX on TPU
 
-![Demo](https://github.com/nathan-barry/tiny-diffusion/releases/download/v2.0.0/animation.gif)
+GPT has been the undisputed king of text generation for years. But what if there's a fundamentally better way to generate text — not one token at a time, left to right, but **entire blocks in parallel**, like watching noise crystallize into coherent sentences?
 
-This repo also contains a tiny GPT implementation in ~313 lines of code. ~80% of the code between the two files is the exact same, highlighting the core differences between Autoregressive and Diffusion language models.
+That's exactly what **Diffusion Language Models (DLLMs)** do. Inspired by image diffusion models like Stable Diffusion, DLLMs start from a sequence of masked ("noised") tokens and iteratively denoise them until clean text emerges. And the surprising part? It takes only **5 small changes** to turn a GPT into a Diffusion model.
 
-**🚀 NEW:** We now feature **JAX/Flax (NNX)** implementations (`diffusion_nnx.py`, `gpt_nnx.py`, and `diffusion_nnx.ipynb`) optimized for distributed training on **Google Cloud TPUs**.
+All code is available in the [yblee/tpu-project-2026](https://github.com/yblee/tpu-project-2026) repository, which is heavily inspired by the original [tiny-diffusion](https://github.com/nathan-barry/tiny-diffusion) and extends it with JAX/Flax NNX implementations optimized for TPU training.
 
-> This is `v2` of this project, which simplified the diffusion code from ~1,000 lines to ~400, and slightly altered the architecture. To view the original version, view the `old` branch.
+---
 
+## What is a Diffusion Language Model?
 
-## Quick Start
+If you've used Stable Diffusion or Midjourney, you already understand the core idea. Image diffusion models start from pure noise and iteratively denoise it into a coherent image. **DLLMs apply the same principle to discrete text.**
 
-### Installation
+Instead of predicting the next token given past tokens, a DLLM receives a sequence where some tokens have been replaced with a special `MASK` token, and it learns to recover the original tokens.
+
+### DLLM vs. GPT at a Glance
+
+| Feature | GPT (Autoregressive) | DLLM (Diffusion) |
+| :--- | :--- | :--- |
+| **Generation** | Sequential, one token at a time | Parallel, entire blocks at once |
+| **Attention** | Causal (past tokens only) | Bidirectional (all tokens) |
+| **Training Objective** | Next-token prediction | Masked token recovery (denoising) |
+| **Context** | Unidirectional | Global / Bidirectional |
+
+The bidirectional attention is the key insight: during generation, the model can see the entire sequence — both already-decoded tokens and still-masked positions — to make better predictions about each position simultaneously.
+
+---
+
+## Training Data: The Complete Sherlock Holmes
+
+The model is trained on the **complete Sherlock Holmes collection** by Arthur Conan Doyle — sourced from the [Sherlock Books](https://www.kaggle.com/datasets/talesgomes27/sherleck-books) dataset on Kaggle. This includes all four novels and fifty-six short stories, from *A Study in Scarlet* to *The Case-Book of Sherlock Holmes*.
+
+- **Rich, consistent prose style** — Doyle's Victorian English has a distinctive rhythm and vocabulary that makes it easy to visually evaluate generation quality
+- **Right size for experimentation** — The complete corpus is large enough to train meaningful patterns but small enough to iterate quickly
+- **Character-level modeling** — At the character level, the model learns to spell Victorian-era words, reproduce dialogue formatting (`" Holmes said, "`), and even pick up on recurring phrases like `"elementary"` or `"the game is afoot"`
+- **Public domain** — All works are freely available via Project Gutenberg
+
+---
+
+## The 5 Changes That Turn GPT into a Diffusion Model
+
+Roughly 80% of the code between `gpt.py` and `diffusion.py` is identical. Here are the 5 surgical modifications:
+
+**1. Add a mask token to the vocabulary**
+
+```python
+chars = sorted(list(set(text)))
+chars = ["_"] + chars  # Mask token added
+mask_token_id = stoi["_"]
+```
+
+**2. Switch from causal to bidirectional attention**
+
+```python
+# GPT:  y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+# DLLM: y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+```
+
+**3. Change the training objective from next-token to unmasking**
+
+```python
+x_orig = jnp.stack([dataset[i : i + block_size] for i in ix])
+mask = jax.random.uniform(rng, ...) < mask_probs
+x = jnp.where(mask, mask_token_id, x_orig)  # Replace some tokens with mask
+```
+
+**4. Only masked tokens contribute to the loss**
+
+```python
+loss_all = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+loss = jnp.sum(loss_all * mask) / (jnp.sum(mask) + 1e-6)
+```
+
+**5. Replace sequential decoding with confidence-based parallel decoding**
+
+---
+
+## Parallel Decoding: How DLLMs Generate Text
+
+Unlike GPT's simple "predict next token, append, repeat" loop, DLLMs use an iterative **confidence-based decoding** strategy:
+
+```python
+while jnp.any(masked):
+    logits, _ = model(x)
+    probs = jax.nn.softmax(logits / temp, axis=-1)
+    top_k_probs, top_k_indices = jax.lax.top_k(probs, k=top_k)
+    confidences = jnp.sum(top_k_probs, axis=-1)
+
+    # Only decode positions where the model is confident enough
+    decode_mask = (confidences >= confidence_threshold) & masked
+    if not jnp.any(decode_mask):
+        flat_idx = jnp.argmax(jnp.where(masked, confidences, -1.0))
+        decode_mask = decode_mask.at[jnp.unravel_index(flat_idx, decode_mask.shape)].set(True)
+
+    x = jnp.where(decode_mask, sampled_tokens, x)
+    masked = masked & ~decode_mask
+```
+
+1. Start with a block of masked tokens
+2. Run the model on the entire sequence
+3. Calculate confidence (top-k probability sum) at each position
+4. **Lock in** tokens where confidence exceeds a threshold
+5. Repeat until all positions are decoded
+6. Move to the next block
+
+Instead of generating 240 tokens in 240 sequential steps (like GPT), the model can decode multiple tokens per step — sometimes resolving the entire block in just 10-20 iterations.
+
+---
+
+## Why Flax NNX?
+
+### The Old Flax vs. NNX
+
+Traditional Flax (`linen`) used a functional programming model where modules were immutable dataclasses and you had to manage separate parameter dictionaries. NNX introduces **stateful, object-oriented modules** that feel much closer to PyTorch:
+
+```python
+class MultiHeadAttention(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.c_q = nnx.Linear(n_embd, n_embd, use_bias=False, rngs=rngs)
+        self.c_k = nnx.Linear(n_embd, n_embd, use_bias=False, rngs=rngs)
+        self.c_v = nnx.Linear(n_embd, n_embd, use_bias=False, rngs=rngs)
+        self.c_proj = nnx.Linear(n_embd, n_embd, use_bias=False, rngs=rngs)
+```
+
+Parameters live directly on the module — no separate `params` dictionary needed.
+
+### Training Loop with NNX
+
+```python
+rngs = nnx.Rngs(1337)
+model = DiffusionModel(rngs)
+optimizer = nnx.Optimizer(model, optax.adamw(learning_rate))
+
+@nnx.jit
+def train_step(model, optimizer, x, y, mask):
+    def loss_fn(model):
+        _, loss = model(x, y, mask)
+        return loss
+    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    optimizer.update(grads)
+    return loss
+```
+
+### Non-Parameter State with `nnx.Variable`
+
+```python
+class DiffusionModel(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        cos, sin = self._precompute_rotary_embeddings(block_size * 2)
+        self.cos = nnx.Variable(cos)  # Not a trainable parameter
+        self.sin = nnx.Variable(sin)
+```
+
+`nnx.Variable` registers the tensor as part of the module's state but excludes it from gradient computation — the NNX equivalent of PyTorch's `register_buffer`.
+
+---
+
+## Scaling Up: TPU Data Parallelism with JAX
+
+### Device Mesh and Sharding
+
+```python
+devices = jax.devices()
+mesh = Mesh(devices, ('batch',))
+data_sharding = NamedSharding(mesh, P('batch'))
+replicated_sharding = NamedSharding(mesh, P())
+```
+
+With just three lines, the batch dimension is split across all available TPU cores.
+
+### Scaled-Up Architecture
+
+| Parameter | PyTorch (GPU) | JAX/Flax (TPU) |
+| :--- | :--- | :--- |
+| `n_embd` | 384 | 768 |
+| `n_head` | 6 | 12 |
+| `n_layer` | 6 | 12 |
+| `block_size` | 256 | 1024 |
+| `batch_size` | 64 | 256 |
+| Parameters | ~10.7M | ~85M |
+
+This brings the model to **GPT-2 Small/Medium scale** with a 4x larger context window.
+
+---
+
+## Model Architecture Deep Dive
+
+- **RMSNorm instead of LayerNorm** — Simplified normalization with no learnable parameters
+- **Rotary Positional Embeddings (RoPE)** — Relative positional encoding applied to Q and K
+- **QK-Norm** — Normalizing queries and keys before attention (stabilizes training)
+- **ReLU-Squared activation** — A simple but effective alternative to GeGLU
+- **No bias in any linear layer** — Following modern best practices for large-scale training
+
+```python
+class Block(nnx.Module):
+    def __call__(self, x, cos_sin):
+        x = x + self.attn(rms_norm(x), cos_sin)
+        x = x + self.mlp(rms_norm(x))
+        return x
+```
+
+---
+
+## Get Started
+
+### Files
+
+- `diffusion_nnx.ipynb` — Interactive TPU notebook (Google Colab compatible)
+- `diffusion_nnx.py` — Standalone TPU training script
+- `diffusion.py` / `gpt.py` — PyTorch implementations for comparison
+
+### Run Locally
+
 ```bash
-# Install dependencies (Python 3.10+)
+git clone https://github.com/yblee/tpu-project-2026.git
+cd tpu-project-2026/tiny-diffusion
 uv sync
-
-# Download the trained model weights (if you don't want to train it from scratch)
-mkdir -p weights && wget -P weights https://github.com/nathan-barry/tiny-diffusion/releases/download/v2.0.0/{gpt,diffusion}.pt
+uv run diffusion.py  # Generate text with pre-trained weights
 ```
 
-### Generation
-Generate text with the trained PyTorch models:
-```bash
-# Diffusion (parallel decoding)
-uv run diffusion.py
+### Run on TPU
 
-# GPT (autoregressive)
-uv run gpt.py
-```
-Both models generate 2,000 characters by default and use the first 16 characters of the dataset as the initial context. These parameters can be modified in the `generate` function.
-
-### Training
-To train the base PyTorch models from scratch:
-
-```bash
-# Train diffusion model
-uv run diffusion.py --train
-
-# Train GPT model
-uv run gpt.py --train
-```
-The `gpt` model trains for 5,000 iterations while the `diffusion` model trains for 10,000, taking ~10 and ~20 minutes respectively on an A100 GPU. The weights are saved to the `weights/` directory.
-
-The diffusion model trains for twice as long because half as many tokens count towards the loss during training (only masked tokens contribute to the loss).
-
-### Visualization
-Visualize the generation process step-by-step directly in your terminal using an awesome "Cryptographic Decoupling" theme:
-
-```bash
-# Visualize diffusion model only
-uv run visualize.py
-
-# Compare diffusion and GPT side-by-side sequentially
-uv run visualize.py --compare
-
-# Generate more blocks
-uv run visualize.py --blocks 10
-```
+Open `diffusion_nnx.ipynb` in a TPU-enabled Google Colab and run all cells. The notebook will automatically install JAX TPU dependencies, download the Sherlock Holmes dataset from Kaggle, and start training.
 
 ---
-
-## 🔥 Scaling Up: JAX & Google Cloud TPUs
-
-If you want to experience distributed training on Google Cloud TPUs, this repository provides scaled-up versions of both models using **JAX and Flax's new NNX API**.
-
-The `*_nnx.py` scripts implement a larger 768-dimension model (GPT-2 Small/Medium scale) with a 1024 context length. Using `NamedSharding`, the code automatically parallelizes batch processing across all available TPU cores (e.g., an 8-core v3-8 Pod).
-
-### Running on a TPU VM
-1. Provision a Cloud TPU VM (e.g., `v3-8`).
-2. SSH into the machine and clone this repo.
-3. Install the specific JAX TPU wheel:
-   ```bash
-   pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-   ```
-4. Install the rest of the dependencies:
-   ```bash
-   uv pip install -r pyproject.toml
-   ```
-5. Run the TPU-optimized training script:
-   ```bash
-   python diffusion_nnx.py --train
-   ```
-
-You can also interactively train and visualize the model on a TPU-enabled Colab environment using the provided `diffusion_nnx.ipynb` notebook.
-
----
-
-## Differences Between The Models
-
-### GPT (Autoregressive)
-- Predicts the next token given all previous tokens
-- Uses **causal attention** (can only look at past tokens)
-- Generates text **sequentially** (one token at a time, left-to-right)
-- Training: minimize cross-entropy loss on next token prediction
-
-### Diffusion (Non-Autoregressive)
-- Predicts original tokens given partially masked sequences
-- Uses **bidirectional attention** (can look at all tokens)
-- Generates text **in parallel** and in blocks: fills in masked tokens iteratively, then moves to the next block
-- Training: minimize cross-entropy loss on denoising masked tokens
-
-### Key Modifications
-The diffusion model makes **5 key changes** to the GPT architecture:
-
-1. **Add mask token** to vocabulary (`_`) for representing noised tokens
-2. **Change attention** from causal to bidirectional (`is_causal=False`)
-3. **Change generation** from sequential to confidence-based parallel decoding
-4. **Change training objective** from next token prediction to unmasking
-5. **Only masked tokens** contribute to the loss during training
-
 
 ## Acknowledgements
-This project is a fork and extension of the original [tiny-diffusion](https://github.com/nathan-barry/tiny-diffusion) repository created by Nathan Barry. The JAX/Flax implementations and TPU adaptations were built upon this fantastic foundational work.
 
-The code for `gpt.py` and `diffusion.py` take heavy inspiration from the Andrej Karpathy GPT implementations listed below:
-- [nanochat GPT implementation](https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py)
-- ["Let's build GPT" video GPT implementation](https://github.com/karpathy/ng-video-lecture/blob/master/gpt.py)
-
-My GPT implementation, `gpt.py`, aims to strike a balance between simplicity and good generation quality.
-
-The `diffusion.py` file is a modified version of `gpt.py` with as few modifications as possible to get it to do language diffusion.
-
-
-## License
-
-MIT
+This project is hosted at [yblee/tpu-project-2026](https://github.com/yblee/tpu-project-2026). The JAX/Flax NNX implementations and TPU adaptations were heavily **inspired by** the original [tiny-diffusion](https://github.com/nathan-barry/tiny-diffusion) by Nathan Barry. The PyTorch baseline draws from Andrej Karpathy's [nanochat](https://github.com/karpathy/nanochat) and ["Let's build GPT"](https://github.com/karpathy/ng-video-lecture) implementations.
